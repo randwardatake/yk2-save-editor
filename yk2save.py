@@ -77,6 +77,91 @@ def cmd_money(args):
     print(f"money: {old:,} -> {args.yen:,}")
 
 
+def read_par_entry(par_path, name):
+    """Return one decompressed file from a PARC archive (SLLZ v2 / zlib chunks)."""
+    d = open(par_path, "rb").read()
+    nfold, _, nfile, info = struct.unpack_from(">IIII", d, 0x10)
+    names = [d[0x20 + i * 0x40:0x60 + i * 0x40].split(b"\0")[0].decode() for i in range(nfold + nfile)]
+    i = names[nfold:].index(name)
+    _, usize, csize, off, _, offhi = struct.unpack_from(">IIIIII", d, info + i * 0x20)
+    b = d[off | offhi << 32:][:csize]
+    if b[:4] != b"SLLZ":
+        return b
+    if b[5] != 2:
+        sys.exit(f"{name}: unsupported SLLZ version {b[5]}")
+    end = "<" if b[4] == 0 else ">"
+    p = struct.unpack_from(end + "H", b, 6)[0]
+    out = bytearray()
+    while len(out) < usize:
+        chunk = int.from_bytes(b[p:p + 3], "big")
+        data = b[p + 5:p + chunk]
+        try:
+            out += zlib.decompress(data, -15)  # raw deflate
+        except zlib.error:
+            out += zlib.decompress(data)  # some chunks carry a zlib header
+        p += chunk
+    return bytes(out[:usize])
+
+
+def armp_row_names(table):
+    """Row names of a Dragon Engine ARMP table (row index = id)."""
+    t = struct.unpack_from("<I", table, 0x10)[0]
+    rows = struct.unpack_from("<i", table, t)[0]
+    names_ptr = struct.unpack_from("<I", table, t + 0x10)[0]
+    offs = struct.unpack_from(f"<{rows}I", table, names_ptr)
+    return [table[o:table.index(b"\0", o)].decode("utf8", "replace") for o in offs]
+
+
+def chapter_start(db_par, chapter):
+    """First story step of a chapter and its scene_config id, read from the game's db.par."""
+    timeline = read_par_entry(db_par, "timeline.bin")
+    strings = [m.group().decode() for m in re.finditer(rb"[A-Za-z0-9_]{3,}", timeline)]
+    configs = armp_row_names(read_par_entry(db_par, "scene_config.bin"))
+    start = "START%02d" % chapter
+    step_re = re.compile(r"[A-Z]+%02d_\d{4}$" % chapter)
+    # STARTnn appears in several clock lists; the story one is followed by a step that has a scene config.
+    for i, s in enumerate(strings[:-1]):
+        step = strings[i + 1]
+        if s == start and step_re.match(step) and "lexus2_" + step in configs:
+            return step, configs.index("lexus2_" + step)
+    sys.exit(f"chapter {chapter}: start step not found in game data")
+
+
+def set_sheet(body, name, clock, trace):
+    pat = re.compile(
+        rb'\{"\.ver":1,"clock_trace":\[[^\]]*\],"current_clock":"[^"]*","name":"%s"\}' % name.encode()
+    )
+    if len(pat.findall(body)) != 1:
+        sys.exit(f"timeline sheet {name} not found uniquely")
+    tr = b'{".ver":1,"end_clock":"%s","start_clock":"%s"}' % (trace[1].encode(), trace[0].encode()) if trace else b""
+    new = b'{".ver":1,"clock_trace":[%s],"current_clock":"%s","name":"%s"}' % (tr, clock.encode(), name.encode())
+    return pat.sub(lambda _: new, body)
+
+
+def cmd_chapter(args):
+    step, config_id = chapter_start(os.path.join(args.game_dir, "data", "db.par"), args.chapter)
+    body = load(args.save)
+    for c in range(1, args.chapter):
+        body = set_sheet(body, "lexus2_c%02d" % c, "END", ("START", "END"))
+    body = set_sheet(body, "lexus2_c%02d" % args.chapter, "START", None)
+    switch = "START%02d" % args.chapter
+    body = set_sheet(body, "common_program_switch", switch, (switch, switch))
+    # Boot straight into the chapter's first scene config, like the game's own chapter-start autosaves.
+    scene = (
+        b'"scene":{".ver":3,"m_daynight":1,"m_is_boot_config_id_only":true,"m_ppos":[0.0,0.0,0.0,0.0],'
+        b'"m_prev_scene_config_id":0,"m_prev_scene_id":0,"m_return_history":[{".ver":2,"config_id":0,'
+        b'"daynight":0,"pos_w":0.0,"pos_x":0.0,"pos_y":0.0,"pos_z":0.0,"scene_id":0,"stage_id":0}],'
+        b'"m_scene_config_id":%d,"m_scene_id":0,"m_stage":0,"version":3}' % config_id
+    )
+    body, n = re.subn(rb'"scene":\{"\.ver":3,.*?"version":3\}', lambda _: scene, body, count=1)
+    if n != 1:
+        sys.exit("scene block not found")
+    body = re.sub(rb'"m_subtitle":"[^"]*"', b'"m_subtitle":"Chapter %d start (edited)"' % args.chapter, body, count=1)
+    json.loads(body)
+    store(args.save, body)
+    print(f"chapter {args.chapter}: boot scene config {config_id} (lexus2_{step}), switch {switch}")
+
+
 def cmd_decrypt(args):
     body = load(args.save)
     with open(args.out, "wb") as f:
@@ -107,6 +192,12 @@ def main():
     s.add_argument("save")
     s.add_argument("yen", type=int)
     s.set_defaults(func=cmd_money)
+
+    s = sub.add_parser("chapter", help="make the save boot at the start of a chapter")
+    s.add_argument("save")
+    s.add_argument("chapter", type=int, choices=range(2, 11), metavar="2-10")
+    s.add_argument("--game-dir", required=True, help="folder containing data/db.par (runtime/media)")
+    s.set_defaults(func=cmd_chapter)
 
     s = sub.add_parser("decrypt", help="dump plain JSON for manual editing")
     s.add_argument("save")
